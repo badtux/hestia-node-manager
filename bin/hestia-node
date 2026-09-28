@@ -1,0 +1,552 @@
+#!/usr/bin/env bash
+#=========================================================================#
+# Hestia Node Manager - Command Line Interface (hestia-node)              #
+#=========================================================================#
+
+set -Eeuo pipefail
+
+VERSION="0.1.0"
+
+# Determine script home directory
+SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+
+# Source modules from installed library or repo
+if [ -d "${PROJECT_ROOT}/lib" ]; then
+    LIB_DIR="${PROJECT_ROOT}/lib"
+elif [ -d "/usr/local/lib/hestia-node-manager/lib" ]; then
+    LIB_DIR="/usr/local/lib/hestia-node-manager/lib"
+else
+    echo "Error: Cannot locate Hestia Node Manager library directory." >&2
+    exit 1
+fi
+
+# shellcheck source=lib/common.sh
+source "${LIB_DIR}/common.sh"
+# shellcheck source=lib/config.sh
+source "${LIB_DIR}/config.sh"
+# shellcheck source=lib/validation.sh
+source "${LIB_DIR}/validation.sh"
+# shellcheck source=lib/hestia.sh
+source "${LIB_DIR}/hestia.sh"
+# shellcheck source=lib/ports.sh
+source "${LIB_DIR}/ports.sh"
+# shellcheck source=lib/nginx.sh
+source "${LIB_DIR}/nginx.sh"
+# shellcheck source=lib/pm2.sh
+source "${LIB_DIR}/pm2.sh"
+# shellcheck source=lib/doctor.sh
+source "${LIB_DIR}/doctor.sh"
+# shellcheck source=lib/import.sh
+source "${LIB_DIR}/import.sh"
+
+# Load global configuration
+load_config
+
+show_help() {
+    echo -e "${COLOR_BOLD}Hestia Node Manager (hestia-node)${COLOR_RESET} v${VERSION}
+A native Node.js application manager for Hestia Control Panel.
+
+${COLOR_BOLD}USAGE:${COLOR_RESET}
+    hestia-node <COMMAND> [ARGUMENTS...] [OPTIONS...]
+
+${COLOR_BOLD}COMMANDS:${COLOR_RESET}
+    create <USER> <DOMAIN>      Register, configure, and start a Node.js application
+    delete <USER> <DOMAIN>      Stop and deregister an application (preserves app files)
+    start <USER> <DOMAIN>       Start an application process via PM2
+    stop <USER> <DOMAIN>        Stop an application process via PM2
+    restart <USER> <DOMAIN>     Restart an application process via PM2
+    status <USER> [DOMAIN]      Show runtime status and metrics of registered application(s)
+    logs <USER> <DOMAIN>        View recent application logs from PM2
+    port <USER> <DOMAIN>        Get allocated listening port for application
+    list                        List all managed Node.js applications
+    import <USER> <DOMAIN>      Import an existing running application with zero downtime
+    doctor                      Run comprehensive environment and configuration diagnostics
+    version                     Display installed version
+    help                        Show this help message
+
+${COLOR_BOLD}CREATE / IMPORT OPTIONS:${COLOR_RESET}
+    --app-root <PATH>           Path to application root directory
+    --entrypoint <FILE>         Entry script (e.g. app.js, server.js, index.js)
+    --port <PORT>               Explicit port (default: auto-allocated from $PORT_MIN-$PORT_MAX)
+    --process-name <NAME>       Custom PM2 process name (default: domain with hyphens)
+    --watch                     Enable PM2 file watching
+    --dry-run                   Simulate operation without making system changes
+
+${COLOR_BOLD}LOGS OPTIONS:${COLOR_RESET}
+    --lines <NUM>               Number of log lines to show (default: 100)
+
+${COLOR_BOLD}LIST OPTIONS:${COLOR_RESET}
+    --json                      Output in machine-readable JSON format
+
+${COLOR_BOLD}GLOBAL OPTIONS:${COLOR_RESET}
+    -v, --verbose               Enable verbose debug logging
+    -h, --help                  Show help text
+
+${COLOR_BOLD}EXAMPLES:${COLOR_RESET}
+    hestia-node create sjbd d.sjbdigital.org
+    hestia-node create sjbd api.example.com --entrypoint server.js --port 50005
+    hestia-node import sjbd d.sjbdigital.org --port 50001
+    hestia-node status sjbd d.sjbdigital.org
+    hestia-node logs sjbd d.sjbdigital.org --lines 50
+    hestia-node port sjbd d.sjbdigital.org
+    hestia-node doctor"
+}
+
+# Command: create
+cmd_create() {
+    local user="${1:-}"
+    local domain="${2:-}"
+    shift 2 || true
+
+    local app_root=""
+    local entrypoint="app.js"
+    local explicit_port=""
+    local process_name=""
+    local watch="no"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --app-root) app_root="$2"; shift 2 ;;
+            --entrypoint) entrypoint="$2"; shift 2 ;;
+            --port) explicit_port="$2"; shift 2 ;;
+            --process-name) process_name="$2"; shift 2 ;;
+            --watch) watch="yes"; shift ;;
+            --dry-run) DRY_RUN=1; shift ;;
+            *) log_error "Unknown option: $1"; exit 1 ;;
+        esac
+    done
+
+    check_root
+    init_environment
+
+    validate_username "$user" || exit 1
+    validate_domain "$domain" || exit 1
+    validate_entrypoint "$entrypoint" || exit 1
+
+    # Defaults
+    if [ -z "$app_root" ]; then
+        app_root="/home/${user}/web/${domain}/nodeapp"
+    fi
+    if [ -z "$process_name" ]; then
+        process_name="${domain//./-}"
+    fi
+
+    # Check application configuration doesn't already exist
+    local app_conf="${STATE_DIR}/apps/${user}/${domain}.conf"
+    if [ -f "$app_conf" ]; then
+        log_error "Application already exists for $user / $domain ($app_conf). Use 'hestia-node restart' or 'delete' first."
+        exit 1
+    fi
+
+    # Hestia domain validation
+    if hestia_is_installed; then
+        if ! hestia_user_exists "$user"; then
+            log_error "User '$user' does not exist in Hestia Control Panel."
+            exit 1
+        fi
+        if ! hestia_domain_exists "$user" "$domain"; then
+            log_error "Domain '$domain' is not assigned to user '$user' in Hestia Control Panel."
+            exit 1
+        fi
+    fi
+
+    # Directory validation
+    if [ "$DRY_RUN" -eq 0 ] && [ ! -d "$app_root" ]; then
+        log_warn "Application root '$app_root' does not exist. Creating default directory..."
+        run_cmd mkdir -p "$app_root"
+        run_cmd chown "$user:$user" "$app_root"
+    fi
+
+    # If entrypoint doesn't exist, create a basic Hello World starter if empty
+    local full_entry="$app_root/$entrypoint"
+    if [ "$DRY_RUN" -eq 0 ] && [ ! -f "$full_entry" ]; then
+        log_info "Creating default starter application at $full_entry..."
+        cat <<'STARTER' > "$full_entry"
+const http = require('http');
+const port = process.env.PORT || 3000;
+
+const server = http.createServer((req, res) => {
+    res.statusCode = 200;
+    res.setHeader('Content-Type', 'text/plain');
+    res.end('Hello from Hestia Node Manager!\n');
+});
+
+server.listen(port, '127.0.0.1', () => {
+    console.log(`Server running at http://127.0.0.1:${port}/`);
+});
+STARTER
+        chown "$user:$user" "$full_entry"
+        chmod 644 "$full_entry"
+    fi
+
+    # 1. Allocate port
+    local port
+    if [ -n "$explicit_port" ]; then
+        validate_port "$explicit_port" || exit 1
+        reserve_explicit_port "$user" "$domain" "$explicit_port" || exit 1
+        port="$explicit_port"
+    else
+        port=$(allocate_port "$user" "$domain")
+    fi
+    log_info "Allocated application port: $port"
+
+    # 2. Generate Nginx reverse proxy configuration
+    nginx_generate_domain_proxy_conf "$user" "$domain" "$port" || exit 1
+
+    # 3. Create application configuration record
+    local timestamp
+    timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date +"%Y-%m-%d %H:%M:%S")
+    if [ "$DRY_RUN" -eq 0 ]; then
+        mkdir -p "$(dirname "$app_conf")"
+        cat <<EOF > "$app_conf"
+# Hestia Node Manager Application Record
+USER="$user"
+DOMAIN="$domain"
+APP_ROOT="$app_root"
+ENTRYPOINT="$entrypoint"
+PORT="$port"
+PROCESS_MANAGER="pm2"
+PROCESS_NAME="$process_name"
+NODE_VERSION="system"
+AUTOSTART="yes"
+WATCH="$watch"
+CREATED_AT="$timestamp"
+UPDATED_AT="$timestamp"
+EOF
+        chmod 640 "$app_conf"
+    fi
+
+    # 4. Configure Hestia Proxy Template
+    if hestia_is_installed; then
+        hestia_set_proxy_template "$user" "$domain" "$PROXY_TEMPLATE_NAME"
+        hestia_restart_proxy
+    fi
+
+    # 5. Start application with PM2
+    PM2_DEFAULT_WATCH="$watch" pm2_start "$user" "$process_name" "$app_root" "$entrypoint" "$port"
+
+    log_success "Successfully registered and started application for $domain on port $port!"
+}
+
+# Command: delete
+cmd_delete() {
+    local user="${1:-}"
+    local domain="${2:-}"
+    shift 2 || true
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dry-run) DRY_RUN=1; shift ;;
+            *) shift ;;
+        esac
+    done
+
+    check_root
+    validate_username "$user" || exit 1
+    validate_domain "$domain" || exit 1
+
+    local app_conf="${STATE_DIR}/apps/${user}/${domain}.conf"
+    local process_name="${domain//./-}"
+
+    if [ -f "$app_conf" ]; then
+        while IFS='=' read -r k v; do
+            v="${v%\"}" ; v="${v#\"}"
+            if [ "$k" = "PROCESS_NAME" ]; then
+                process_name="$v"
+            fi
+        done < "$app_conf"
+    fi
+
+    log_info "Deregistering application for $user / $domain..."
+
+    # 1. Stop and remove PM2 process
+    pm2_delete "$user" "$process_name"
+
+    # 2. Remove Nginx proxy include snippet
+    nginx_remove_domain_proxy_conf "$user" "$domain"
+
+    # 3. Release port
+    release_port "$user" "$domain"
+
+    # 4. Remove application config
+    if [ -f "$app_conf" ]; then
+        run_cmd rm -f "$app_conf"
+    fi
+
+    # 5. Reload proxy
+    if hestia_is_installed; then
+        hestia_restart_proxy
+    fi
+
+    log_success "Application $domain successfully deregistered and port released."
+    log_info "Note: Application source files were preserved."
+}
+
+# Command: start
+cmd_start() {
+    local user="${1:-}"
+    local domain="${2:-}"
+    check_root
+    validate_username "$user" || exit 1
+    validate_domain "$domain" || exit 1
+
+    local app_conf="${STATE_DIR}/apps/${user}/${domain}.conf"
+    if [ ! -f "$app_conf" ]; then
+        log_error "No registered application found for $user / $domain."
+        exit 1
+    fi
+
+    local p_name="" a_root="" e_point="" port=""
+    while IFS='=' read -r k v; do
+        v="${v%\"}" ; v="${v#\"}"
+        case "$k" in
+            PROCESS_NAME) p_name="$v" ;;
+            APP_ROOT) a_root="$v" ;;
+            ENTRYPOINT) e_point="$v" ;;
+            PORT) port="$v" ;;
+        esac
+    done < "$app_conf"
+
+    pm2_start "$user" "$p_name" "$a_root" "$e_point" "$port"
+}
+
+# Command: stop
+cmd_stop() {
+    local user="${1:-}"
+    local domain="${2:-}"
+    check_root
+    validate_username "$user" || exit 1
+    validate_domain "$domain" || exit 1
+
+    local app_conf="${STATE_DIR}/apps/${user}/${domain}.conf"
+    local p_name="${domain//./-}"
+    if [ -f "$app_conf" ]; then
+        while IFS='=' read -r k v; do
+            v="${v%\"}" ; v="${v#\"}"
+            [ "$k" = "PROCESS_NAME" ] && p_name="$v"
+        done < "$app_conf"
+    fi
+
+    pm2_stop "$user" "$p_name"
+}
+
+# Command: restart
+cmd_restart() {
+    local user="${1:-}"
+    local domain="${2:-}"
+    check_root
+    validate_username "$user" || exit 1
+    validate_domain "$domain" || exit 1
+
+    local app_conf="${STATE_DIR}/apps/${user}/${domain}.conf"
+    local p_name="${domain//./-}"
+    if [ -f "$app_conf" ]; then
+        while IFS='=' read -r k v; do
+            v="${v%\"}" ; v="${v#\"}"
+            [ "$k" = "PROCESS_NAME" ] && p_name="$v"
+        done < "$app_conf"
+    fi
+
+    pm2_restart "$user" "$p_name"
+}
+
+# Command: status
+cmd_status() {
+    local user="${1:-}"
+    local domain="${2:-}"
+
+    if [ -n "$user" ]; then
+        validate_username "$user" || exit 1
+        local p_name=""
+        if [ -n "$domain" ]; then
+            local app_conf="${STATE_DIR}/apps/${user}/${domain}.conf"
+            if [ -f "$app_conf" ]; then
+                while IFS='=' read -r k v; do
+                    v="${v%\"}" ; v="${v#\"}"
+                    [ "$k" = "PROCESS_NAME" ] && p_name="$v"
+                done < "$app_conf"
+            fi
+            p_name="${p_name:-${domain//./-}}"
+        fi
+        pm2_status "$user" "$p_name"
+    else
+        cmd_list
+    fi
+}
+
+# Command: logs
+cmd_logs() {
+    local user="${1:-}"
+    local domain="${2:-}"
+    shift 2 || true
+
+    local lines=100
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --lines) lines="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    validate_username "$user" || exit 1
+    validate_domain "$domain" || exit 1
+
+    local p_name="${domain//./-}"
+    local app_conf="${STATE_DIR}/apps/${user}/${domain}.conf"
+    if [ -f "$app_conf" ]; then
+        while IFS='=' read -r k v; do
+            v="${v%\"}" ; v="${v#\"}"
+            [ "$k" = "PROCESS_NAME" ] && p_name="$v"
+        done < "$app_conf"
+    fi
+
+    pm2_logs "$user" "$p_name" "$lines"
+}
+
+# Command: port
+cmd_port() {
+    local user="${1:-}"
+    local domain="${2:-}"
+    validate_username "$user" || exit 1
+    validate_domain "$domain" || exit 1
+
+    local port
+    port=$(get_port_allocation "$user" "$domain" || true)
+    if [ -n "$port" ]; then
+        echo "$port"
+        return 0
+    else
+        log_error "No port allocated for $user / $domain."
+        return 1
+    fi
+}
+
+# Command: list
+cmd_list() {
+    local json_output=0
+    if [ "${1:-}" = "--json" ]; then
+        json_output=1
+    fi
+
+    if [ "$json_output" -eq 1 ]; then
+        echo "["
+        local first=1
+        while IFS= read -r app_conf; do
+            [ -z "$app_conf" ] && continue
+            local u="" d="" p="" s="" r="" e=""
+            while IFS='=' read -r k v; do
+                v="${v%\"}" ; v="${v#\"}"
+                case "$k" in
+                    USER) u="$v" ;;
+                    DOMAIN) d="$v" ;;
+                    PORT) p="$v" ;;
+                    PROCESS_NAME) s="$v" ;;
+                    APP_ROOT) r="$v" ;;
+                    ENTRYPOINT) e="$v" ;;
+                esac
+            done < "$app_conf"
+
+            [ "$first" -eq 0 ] && echo ","
+            cat <<JSON_ENTRY
+  {
+    "user": "$u",
+    "domain": "$d",
+    "port": $p,
+    "process_name": "$s",
+    "app_root": "$r",
+    "entrypoint": "$e"
+  }
+JSON_ENTRY
+            first=0
+        done < <(find "$STATE_DIR/apps" -type f -name "*.conf" 2>/dev/null || true)
+        echo "]"
+        return 0
+    fi
+
+    printf "%-12s %-25s %-8s %-22s %-12s\n" "USER" "DOMAIN" "PORT" "PROCESS" "OS_PORT"
+    echo "--------------------------------------------------------------------------------"
+    local found=0
+    while IFS= read -r app_conf; do
+        [ -z "$app_conf" ] && continue
+        found=1
+        local u="" d="" p="" s=""
+        while IFS='=' read -r k v; do
+            v="${v%\"}" ; v="${v#\"}"
+            case "$k" in
+                USER) u="$v" ;;
+                DOMAIN) d="$v" ;;
+                PORT) p="$v" ;;
+                PROCESS_NAME) s="$v" ;;
+            esac
+        done < "$app_conf"
+
+        local status="inactive"
+        if is_port_in_use_by_os "$p"; then
+            status="active"
+        fi
+        printf "%-12s %-25s %-8s %-22s %-12s\n" "$u" "$d" "$p" "$s" "$status"
+    done < <(find "$STATE_DIR/apps" -type f -name "*.conf" 2>/dev/null || true)
+
+    if [ "$found" -eq 0 ]; then
+        echo "(No applications registered)"
+    fi
+}
+
+# Command: import
+cmd_import() {
+    local user="${1:-}"
+    local domain="${2:-}"
+    shift 2 || true
+
+    local explicit_port=""
+    local explicit_root=""
+    local explicit_entry=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --port) explicit_port="$2"; shift 2 ;;
+            --app-root) explicit_root="$2"; shift 2 ;;
+            --entrypoint) explicit_entry="$2"; shift 2 ;;
+            --dry-run) DRY_RUN=1; shift ;;
+            *) shift ;;
+        esac
+    done
+
+    check_root
+    init_environment
+    import_application "$user" "$domain" "$explicit_port" "$explicit_root" "$explicit_entry"
+}
+
+# Main CLI entrypoint
+main() {
+    if [ $# -eq 0 ]; then
+        show_help
+        exit 0
+    fi
+
+    # Global flags
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help|help) show_help; exit 0 ;;
+            -v|--version|version) echo "Hestia Node Manager v${VERSION}"; exit 0 ;;
+            --verbose) VERBOSE=1; shift ;;
+            --dry-run) DRY_RUN=1; shift ;;
+            create) shift; cmd_create "$@"; exit 0 ;;
+            delete) shift; cmd_delete "$@"; exit 0 ;;
+            start) shift; cmd_start "$@"; exit 0 ;;
+            stop) shift; cmd_stop "$@"; exit 0 ;;
+            restart) shift; cmd_restart "$@"; exit 0 ;;
+            status) shift; cmd_status "$@"; exit 0 ;;
+            logs) shift; cmd_logs "$@"; exit 0 ;;
+            port) shift; cmd_port "$@"; exit 0 ;;
+            list) shift; cmd_list "$@"; exit 0 ;;
+            doctor) shift; run_doctor; exit 0 ;;
+            import) shift; cmd_import "$@"; exit 0 ;;
+            *) log_error "Unknown command: $1. Run 'hestia-node --help' for usage."; exit 1 ;;
+        esac
+    done
+}
+
+main "$@"

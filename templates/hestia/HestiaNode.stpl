@@ -1,0 +1,44 @@
+#=========================================================================#
+# Default Hestia Node Manager Proxy Template (HTTPS)                      #
+# Template Name: HestiaNode.stpl                                          #
+#=========================================================================#
+
+server {
+    listen      %ip%:%proxy_ssl_port% ssl http2;
+    server_name %domain_idn% %alias_idn%;
+
+    ssl_certificate     %ssl_pem%;
+    ssl_certificate_key %ssl_key%;
+
+    ssl_stapling on;
+    ssl_stapling_verify on;
+
+    error_log /var/log/%web_system%/domains/%domain%.error.log error;
+
+    if ($anti_replay = 307) { return 307 https://$host$request_uri; }
+    if ($anti_replay = 425) { return 425; }
+
+    include %home%/%user%/conf/web/%domain%/nginx.hsts.conf*;
+
+    # Error pages
+    location /error/ {
+        alias %home%/%user%/web/%domain%/document_errors/;
+    }
+
+    # Deny access to hidden files/directories except ACME challenges
+    location ~ /\.(?!well-known\/|file) {
+        deny all;
+        return 404;
+    }
+
+    # Fallback definition if backend is used
+    location @fallback {
+        proxy_pass https://%ip%:%web_ssl_port%;
+    }
+
+    # Hestia Node Manager reverse proxy include
+    include /etc/hestia-node-manager/nginx/%user%_%domain%.conf*;
+
+    # Hestia per-domain custom Nginx directives
+    include %home%/%user%/conf/web/%domain%/nginx.ssl.conf_*;
+}
