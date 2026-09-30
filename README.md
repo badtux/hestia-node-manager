@@ -2,7 +2,7 @@
 
 > A native Node.js application manager for Hestia Control Panel.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Platform: Debian 12 / Ubuntu](https://img.shields.io/badge/Platform-Debian%2012%20%7C%20Ubuntu-orange.svg)](#requirements)
 [![HestiaCP Compatibility](https://img.shields.io/badge/HestiaCP-1.10.5%2B-green.svg)](#hestia-compatibility)
 
@@ -216,7 +216,7 @@ The port allocation engine guarantees zero port collisions through:
 
 Example port lookup:
 ```bash
-sudo hestia-node port sjbd d.sjbdigital.org
+sudo hestia-node port myuser myapp.example.com
 # Output: 50001
 ```
 
@@ -246,7 +246,7 @@ The `HestiaNode` template provides production-grade reverse proxying:
 To migrate existing applications (such as applications previously running under `hcpp-nodeapp` or manual PM2 setups):
 
 ```bash
-sudo hestia-node import sjbd d.sjbdigital.org
+sudo hestia-node import myuser myapp.example.com
 ```
 
 ### What import does:
@@ -306,7 +306,7 @@ Checking State Directory Permissions... [OK] /etc/hestia-node-manager is writabl
 Checking Port Allocation Database... [OK] Port database readable (1 active allocations, range 50000-59999)
 
 Registered Applications Summary:
-  - d.sjbdigital.org (User: sjbd, Port: 50001 [LISTENING], Process: d-sjbdigital-org)
+  - myapp.example.com (User: myuser, Port: 50001 [LISTENING], Process: myapp-example-com)
 
 Diagnostic complete: All checks passed successfully.
 ```
@@ -361,4 +361,4 @@ The test suite validates:
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
+This project is licensed under the [GNU General Public License v3.0](LICENSE).
